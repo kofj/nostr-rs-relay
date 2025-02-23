@@ -11,7 +11,7 @@ mirrored on [GitHub](https://github.com/scsibug/nostr-rs-relay).
 
 [![builds.sr.ht status](https://builds.sr.ht/~gheartsfield/nostr-rs-relay/commits/master.svg)](https://builds.sr.ht/~gheartsfield/nostr-rs-relay/commits/master?)
 
-![Github CI](https://github.com/schlunsen/nostr-rs-relay/actions/workflows/ci.yml/badge.svg)
+![Github CI](https://github.com/scsibug/nostr-rs-relay/actions/workflows/ci.yml/badge.svg)
 
 
 ## Features
@@ -35,6 +35,8 @@ mirrored on [GitHub](https://github.com/scsibug/nostr-rs-relay).
 - [ ] NIP-26: [Event Delegation](https://github.com/nostr-protocol/nips/blob/master/26.md) (_implemented, but currently disabled_)
 - [x] NIP-28: [Public Chat](https://github.com/nostr-protocol/nips/blob/master/28.md)
 - [x] NIP-33: [Parameterized Replaceable Events](https://github.com/nostr-protocol/nips/blob/master/33.md)
+- [x] NIP-40: [Expiration Timestamp](https://github.com/nostr-protocol/nips/blob/master/40.md)
+- [x] NIP-42: [Authentication of clients to relays](https://github.com/nostr-protocol/nips/blob/master/42.md)
 
 ## Quick Start
 
@@ -47,7 +49,7 @@ The examples below start a rootless podman container, mapping a local
 data directory and config file.
 
 ```console
-$ podman build -t nostr-rs-relay .
+$ podman build --pull -t nostr-rs-relay .
 
 $ mkdir data
 
@@ -91,6 +93,16 @@ https://hub.docker.com/r/scsibug/nostr-rs-relay
 
 Building `nostr-rs-relay` requires an installation of Cargo & Rust: https://www.rust-lang.org/tools/install
 
+The following OS packages will be helpful; on Debian/Ubuntu:
+```console
+$ sudo apt-get install build-essential cmake protobuf-compiler pkg-config libssl-dev
+```
+
+On OpenBSD:
+```console
+$ doas pkg_add rust protobuf
+```
+
 Clone this repository, and then build a release version of the relay:
 
 ```console
@@ -129,6 +141,7 @@ be mounted into a docker container like so:
 $ docker run -it -p 7000:8080 \
   --mount src=$(pwd)/config.toml,target=/usr/src/app/config.toml,type=bind \
   --mount src=$(pwd)/data,target=/usr/src/app/db,type=bind \
+  --mount src=$(pwd)/index.html,target=/usr/src/app/index.html,type=bind \
   nostr-rs-relay
 ```
 
@@ -139,16 +152,12 @@ settings.
 
 For examples of putting the relay behind a reverse proxy (for TLS
 termination, load balancing, and other features), see [Reverse
-Proxy](reverse-proxy.md).
+Proxy](docs/reverse-proxy.md).
 
 ## Dev Channel
 
 For development discussions, please feel free to use the [sourcehut
 mailing list](https://lists.sr.ht/~gheartsfield/nostr-rs-relay-devel).
-Or, drop by the [Nostr Telegram Channel](https://t.me/nostr_protocol).
-
-To chat about `nostr-rs-relay` on `nostr` itself; visit our channel on [anigma](https://anigma.io/) or another client that supports [NIP-28](https://github.com/nostr-protocol/nips/blob/master/28.md) chats:
- * `2ad246a094fee48c6e455dd13d759d5f41b5a233120f5719d81ebc1935075194`
 
 License
 ---

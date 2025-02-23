@@ -1,2 +1,5 @@
-/target
+**/target/
 nostr.db
+nostr.db-*
+justfile
+result

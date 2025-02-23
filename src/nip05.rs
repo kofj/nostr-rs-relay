@@ -8,11 +8,11 @@ use crate::config::VerifiedUsers;
 use crate::error::{Error, Result};
 use crate::event::Event;
 use crate::repo::NostrRepo;
-use std::sync::Arc;
 use hyper::body::HttpBody;
 use hyper::client::connect::HttpConnector;
 use hyper::Client;
-use hyper_tls::HttpsConnector;
+use hyper_rustls::HttpsConnector;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -48,7 +48,8 @@ pub struct Nip05Name {
 
 impl Nip05Name {
     /// Does this name represent the entire domain?
-    #[must_use] pub fn is_domain_only(&self) -> bool {
+    #[must_use]
+    pub fn is_domain_only(&self) -> bool {
         self.local == "_"
     }
 
@@ -58,8 +59,8 @@ impl Nip05Name {
             "https://{}/.well-known/nostr.json?name={}",
             self.domain, self.local
         )
-            .parse::<http::Uri>()
-            .ok()
+        .parse::<http::Uri>()
+        .ok()
     }
 }
 
@@ -73,7 +74,10 @@ impl std::convert::TryFrom<&str> for Nip05Name {
             // check if local name is valid
             let local = components[0];
             let domain = components[1];
-            if local.chars().all(|x| x.is_alphanumeric() || x == '_' || x == '-' || x == '.') {
+            if local
+                .chars()
+                .all(|x| x.is_alphanumeric() || x == '_' || x == '-' || x == '.')
+            {
                 if domain
                     .chars()
                     .all(|x| x.is_alphanumeric() || x == '-' || x == '.')
@@ -117,7 +121,7 @@ fn body_contains_user(username: &str, address: &str, bytes: &hyper::body::Bytes)
     // get the pubkey for the requested user
     let check_name = names_map.get(username).and_then(serde_json::Value::as_str);
     // ensure the address is a match
-    Ok(check_name.map_or(false, |x| x == address))
+    Ok(check_name == Some(address))
 }
 
 impl Verifier {
@@ -129,7 +133,12 @@ impl Verifier {
     ) -> Result<Self> {
         info!("creating NIP-05 verifier");
         // setup hyper client
-        let https = HttpsConnector::new();
+        let https = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_native_roots()
+            .https_or_http()
+            .enable_http1()
+            .build();
+
         let client = Client::builder().build::<_, hyper::Body>(https);
 
         // After all accounts have been re-verified, don't check again
@@ -199,7 +208,7 @@ impl Verifier {
             .ok_or_else(|| Error::CustomError("invalid NIP-05 URL".to_owned()))?;
         let req = hyper::Request::builder()
             .method(hyper::Method::GET)
-            .uri(url)
+            .uri(url.clone())
             .header("Accept", "application/json")
             .header(
                 "User-Agent",
@@ -217,38 +226,84 @@ impl Verifier {
             // limit size of verification document to 1MB.
             const MAX_ALLOWED_RESPONSE_SIZE: u64 = 1024 * 1024;
             let response = response_res?;
+            let status = response.status();
+
+            // Log non-2XX status codes
+            if !status.is_success() {
+                info!(
+                    "unexpected status code {} received for account {:?} at URL: {}",
+                    status,
+                    nip.to_string(),
+                    url
+                );
+                return Ok(UserWebVerificationStatus::Unknown);
+            }
+
             // determine content length from response
             let response_content_length = match response.body().size_hint().upper() {
                 Some(v) => v,
-                None => MAX_ALLOWED_RESPONSE_SIZE + 1, // reject missing content length
+                None => {
+                    info!(
+                        "missing content length header for account {:?} at URL: {}",
+                        nip.to_string(),
+                        url
+                    );
+                    return Ok(UserWebVerificationStatus::Unknown);
+                }
             };
-            // TODO: test how hyper handles the client providing an inaccurate content-length.
-            if response_content_length <= MAX_ALLOWED_RESPONSE_SIZE {
-                let (parts, body) = response.into_parts();
-                // TODO: consider redirects
-                if parts.status == http::StatusCode::OK {
-                    // parse body, determine if the username / key / address is present
-                    let body_bytes = hyper::body::to_bytes(body).await?;
-                    let body_matches = body_contains_user(&nip.local, pubkey, &body_bytes)?;
-                    if body_matches {
-                        return Ok(UserWebVerificationStatus::Verified);
+
+            if response_content_length > MAX_ALLOWED_RESPONSE_SIZE {
+                info!(
+                    "content length {} exceeded limit of {} bytes for account {:?} at URL: {}",
+                    response_content_length,
+                    MAX_ALLOWED_RESPONSE_SIZE,
+                    nip.to_string(),
+                    url
+                );
+                return Ok(UserWebVerificationStatus::Unknown);
+            }
+
+            let (parts, body) = response.into_parts();
+            // TODO: consider redirects
+            if parts.status == http::StatusCode::OK {
+                // parse body, determine if the username / key / address is present
+                let body_bytes = match hyper::body::to_bytes(body).await {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        info!(
+                            "failed to read response body for account {:?} at URL: {}: {:?}",
+                            nip.to_string(),
+                            url,
+                            e
+                        );
+                        return Ok(UserWebVerificationStatus::Unknown);
                     }
-                    // successful response, parsed as a nip-05
-                    // document, but this name/pubkey was not
-                    // present.
-                    return Ok(UserWebVerificationStatus::Unverified);
+                };
+
+                match body_contains_user(&nip.local, pubkey, &body_bytes) {
+                    Ok(true) => Ok(UserWebVerificationStatus::Verified),
+                    Ok(false) => Ok(UserWebVerificationStatus::Unverified),
+                    Err(e) => {
+                        info!(
+                            "error parsing response body for account {:?}: {:?}",
+                            nip.to_string(),
+                            e
+                        );
+                        Ok(UserWebVerificationStatus::Unknown)
+                    }
                 }
             } else {
                 info!(
-                    "content length missing or exceeded limits for account: {:?}",
+                    "unexpected status code {} for account {:?}",
+                    parts.status,
                     nip.to_string()
                 );
+                Ok(UserWebVerificationStatus::Unknown)
             }
         } else {
             info!("timeout verifying account {:?}", nip);
-            return Ok(UserWebVerificationStatus::Unknown);
+            Ok(UserWebVerificationStatus::Unknown)
         }
-        Ok(UserWebVerificationStatus::Unknown)
     }
 
     /// Perform NIP-05 verifier tasks.
@@ -261,10 +316,10 @@ impl Verifier {
                 Err(Error::ChannelClosed) => {
                     // channel was closed, we are shutting down
                     return;
-                },
+                }
                 Err(e) => {
-                info!("error in verifier: {:?}", e);
-                },
+                    info!("error in verifier: {:?}", e);
+                }
                 _ => {}
             }
         }
@@ -349,42 +404,41 @@ impl Verifier {
                     UserWebVerificationStatus::Verified => {
                         // freshly verified account, update the
                         // timestamp.
-                        self.repo.update_verification_timestamp(v.rowid)
-                            .await?;
+                        self.repo.update_verification_timestamp(v.rowid).await?;
                         info!("verification updated for {}", v.to_string());
-
                     }
                     UserWebVerificationStatus::DomainNotAllowed
-			| UserWebVerificationStatus::Unknown => {
-                            // server may be offline, or temporarily
-                            // blocked by the config file.  Note the
-                            // failure so we can process something
-                            // else.
+                    | UserWebVerificationStatus::Unknown => {
+                        // server may be offline, or temporarily
+                        // blocked by the config file.  Note the
+                        // failure so we can process something
+                        // else.
 
-                            // have we had enough failures to give up?
-                            if v.failure_count >= max_failures as u64 {
-				info!(
-                                    "giving up on verifying {:?} after {} failures",
-                                    v.name, v.failure_count
-				);
-				self.repo.delete_verification(v.rowid)
-                                    .await?;
-                            } else {
-				// record normal failure, incrementing failure count
-				info!("verification failed for {}", v.to_string());
-				self.repo.fail_verification(v.rowid).await?;
-                            }
-			}
+                        // have we had enough failures to give up?
+                        if v.failure_count >= max_failures as u64 {
+                            info!(
+                                "giving up on verifying {:?} after {} failures",
+                                v.name, v.failure_count
+                            );
+                            self.repo.delete_verification(v.rowid).await?;
+                        } else {
+                            // record normal failure, incrementing failure count
+                            info!("verification failed for {}", v.to_string());
+                            self.repo.fail_verification(v.rowid).await?;
+                        }
+                    }
                     UserWebVerificationStatus::Unverified => {
                         // domain has removed the verification, drop
                         // the record on our side.
                         info!("verification rescinded for {}", v.to_string());
-                        self.repo.delete_verification(v.rowid)
-                            .await?;
+                        self.repo.delete_verification(v.rowid).await?;
                     }
                 }
             }
-            Err(Error::SqlError(rusqlite::Error::QueryReturnedNoRows)) => {
+            Err(
+                Error::SqlError(rusqlite::Error::QueryReturnedNoRows)
+                | Error::SqlxError(sqlx::Error::RowNotFound),
+            ) => {
                 // No users need verification.  Reset the interval to
                 // the next verification attempt.
                 let start = tokio::time::Instant::now() + self.wait_after_finish;
@@ -433,7 +487,9 @@ impl Verifier {
             }
         }
         // write the verification record
-        self.repo.create_verification_record(&event.id, name).await?;
+        self.repo
+            .create_verification_record(&event.id, name)
+            .await?;
         Ok(())
     }
 }
@@ -463,7 +519,8 @@ pub struct VerificationRecord {
 
 /// Check with settings to determine if a given domain is allowed to
 /// publish.
-#[must_use] pub fn is_domain_allowed(
+#[must_use]
+pub fn is_domain_allowed(
     domain: &str,
     whitelist: &Option<Vec<String>>,
     blacklist: &Option<Vec<String>>,
@@ -483,7 +540,8 @@ pub struct VerificationRecord {
 impl VerificationRecord {
     /// Check if the record is recent enough to be considered valid,
     /// and the domain is allowed.
-    #[must_use] pub fn is_valid(&self, verified_users_settings: &VerifiedUsers) -> bool {
+    #[must_use]
+    pub fn is_valid(&self, verified_users_settings: &VerifiedUsers) -> bool {
         //let settings = SETTINGS.read().unwrap();
         // how long a verification record is good for
         let nip05_expiration = &verified_users_settings.verify_expiration_duration;

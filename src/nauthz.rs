@@ -35,13 +35,13 @@ impl std::convert::From<Nip05Name> for nauthz_grpc::event_request::Nip05Name {
     fn from(value: Nip05Name) -> Self {
         nauthz_grpc::event_request::Nip05Name {
             local: value.local.clone(),
-            domain: value.domain.clone(),
+            domain: value.domain,
         }
     }
 }
 
 // conversion of event tags into gprc struct
-fn tags_to_protobuf(tags: &Vec<Vec<String>>) -> Vec<TagEntry> {
+fn tags_to_protobuf(tags: &[Vec<String>]) -> Vec<TagEntry> {
     tags.iter()
         .map(|x| TagEntry { values: x.clone() })
         .collect()
@@ -57,7 +57,7 @@ impl EventAuthzService {
         eas
     }
 
-    pub async fn ready_connection(self: &mut Self) {
+    pub async fn ready_connection(&mut self) {
         if self.conn.is_none() {
             let client = AuthorizationClient::connect(self.server_addr.to_string()).await;
             if let Err(ref msg) = client {
@@ -70,12 +70,13 @@ impl EventAuthzService {
     }
 
     pub async fn admit_event(
-        self: &mut Self,
+        &mut self,
         event: &Event,
         ip: &str,
         origin: Option<String>,
         user_agent: Option<String>,
         nip05: Option<Nip05Name>,
+        auth_pubkey: Option<Vec<u8>>,
     ) -> Result<Box<dyn AuthzDecision>> {
         self.ready_connection().await;
         let id_blob = hex::decode(&event.id)?;
@@ -97,14 +98,14 @@ impl EventAuthzService {
                     ip_addr: Some(ip.to_string()),
                     origin,
                     user_agent,
-                    auth_pubkey: None,
-                    nip05: nip05.map(|x| nauthz_grpc::event_request::Nip05Name::from(x)),
+                    auth_pubkey,
+                    nip05: nip05.map(nauthz_grpc::event_request::Nip05Name::from),
                 })
                 .await?;
             let reply = svr_res.into_inner();
-            return Ok(Box::new(reply));
+            Ok(Box::new(reply))
         } else {
-            return Err(Error::AuthzError);
+            Err(Error::AuthzError)
         }
     }
 }

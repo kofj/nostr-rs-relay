@@ -3,38 +3,52 @@ use crate::close::Close;
 use crate::close::CloseCmd;
 use crate::config::{Settings, VerifiedUsersMode};
 use crate::conn;
-use crate::repo::NostrRepo;
 use crate::db;
 use crate::db::SubmittedEvent;
 use crate::error::{Error, Result};
 use crate::event::Event;
 use crate::event::EventCmd;
+use crate::event::EventWrapper;
 use crate::info::RelayInfo;
 use crate::nip05;
 use crate::notice::Notice;
+use crate::payment;
+use crate::payment::InvoiceInfo;
+use crate::payment::PaymentMessage;
+use crate::repo::NostrRepo;
+use crate::server::Error::CommandUnknownError;
+use crate::server::EventWrapper::{WrappedAuth, WrappedEvent};
 use crate::subscription::Subscription;
-use prometheus::IntCounterVec;
-use prometheus::IntGauge;
-use prometheus::{Encoder, Histogram, IntCounter, HistogramOpts, Opts, Registry, TextEncoder};
 use futures::SinkExt;
 use futures::StreamExt;
 use governor::{Jitter, Quota, RateLimiter};
 use http::header::HeaderMap;
+use hyper::body::to_bytes;
 use hyper::header::ACCEPT;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::upgrade::Upgraded;
 use hyper::{
     header, server::conn::AddrStream, upgrade, Body, Request, Response, Server, StatusCode,
 };
+use nostr::key::FromPkStr;
+use nostr::key::Keys;
+use prometheus::IntCounterVec;
+use prometheus::IntGauge;
+use prometheus::{Encoder, Histogram, HistogramOpts, IntCounter, Opts, Registry, TextEncoder};
+use qrcode::render::svg;
+use qrcode::QrCode;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::fs::File;
+use std::io::BufReader;
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver as MpscReceiver;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::runtime::Builder;
@@ -58,7 +72,9 @@ async fn handle_web_request(
     remote_addr: SocketAddr,
     broadcast: Sender<Event>,
     event_tx: tokio::sync::mpsc::Sender<SubmittedEvent>,
+    payment_tx: tokio::sync::broadcast::Sender<PaymentMessage>,
     shutdown: Receiver<()>,
+    favicon: Option<Vec<u8>>,
     registry: Registry,
     metrics: NostrMetrics,
 ) -> Result<Response<Body>, Infallible> {
@@ -96,7 +112,7 @@ async fn handle_web_request(
                                     tokio_tungstenite::tungstenite::protocol::Role::Server,
                                     Some(config),
                                 )
-                                    .await;
+                                .await;
                                 let origin = get_header_string("origin", request.headers());
                                 let user_agent = get_header_string("user-agent", request.headers());
                                 // determine the remote IP from headers if the exist
@@ -157,22 +173,47 @@ async fn handle_web_request(
                     if mt_str.contains("application/nostr+json") {
                         // build a relay info response
                         debug!("Responding to server info request");
-                        let rinfo = RelayInfo::from(settings.info);
+                        let rinfo = RelayInfo::from(settings);
                         let b = Body::from(serde_json::to_string_pretty(&rinfo).unwrap());
                         return Ok(Response::builder()
-                                  .status(200)
-                                  .header("Content-Type", "application/nostr+json")
-                                  .header("Access-Control-Allow-Origin", "*")
-                                  .body(b)
-                                  .unwrap());
+                            .status(200)
+                            .header("Content-Type", "application/nostr+json")
+                            .header("Access-Control-Allow-Origin", "*")
+                            .body(b)
+                            .unwrap());
                     }
                 }
             }
+
+            // Redirect users to join page when pay to relay enabled
+            if settings.pay_to_relay.enabled {
+                return Ok(Response::builder()
+                    .status(StatusCode::TEMPORARY_REDIRECT)
+                    .header("location", "/join")
+                    .body(Body::empty())
+                    .unwrap());
+            }
+
+            if let Some(relay_file_path) = settings.info.relay_page {
+                match file_bytes(&relay_file_path) {
+                    Ok(file_content) => {
+                        return Ok(Response::builder()
+                            .status(200)
+                            .header("Content-Type", "text/html; charset=UTF-8")
+                            .body(Body::from(file_content))
+                            .expect("request builder"));
+                    }
+                    Err(err) => {
+                        error!("Failed to read relay_page file: {}. Will use default", err);
+                    }
+                }
+            }
+
             Ok(Response::builder()
-               .status(200)
-               .header("Content-Type", "text/plain")
-               .body(Body::from("Please use a Nostr client to connect."))
-               .unwrap())
+                .status(200)
+                .header("Content-Type", "text/plain")
+                .body(Body::from("Please use a Nostr client to connect."))
+                .unwrap())
         }
         ("/metrics", false) => {
             let mut buffer = vec![];
@@ -181,19 +222,445 @@ async fn handle_web_request(
             encoder.encode(&metric_families, &mut buffer).unwrap();
 
             Ok(Response::builder()
-               .status(StatusCode::OK)
-               .header("Content-Type", "text/plain")
-               .body(Body::from(buffer))
-               .unwrap())
+                .status(StatusCode::OK)
+                .header("Content-Type", "text/plain")
+                .body(Body::from(buffer))
+                .unwrap())
         }
-        (_, _) => {
-            //handle any other url
+        ("/favicon.ico", false) => {
+            if let Some(favicon_bytes) = favicon {
+                info!("returning favicon");
+                Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "image/x-icon")
+                    // 1 month cache
+                    .header("Cache-Control", "public, max-age=2419200")
+                    .body(Body::from(favicon_bytes))
+                    .unwrap())
+            } else {
+                Ok(Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Body::from(""))
+                    .unwrap())
+            }
+        }
+        // LN bits callback endpoint for paid invoices
+        ("/lnbits", false) => {
+            let callback: payment::lnbits::LNBitsCallback =
+                serde_json::from_slice(&to_bytes(request.into_body()).await.unwrap()).unwrap();
+            debug!("LNBits callback: {callback:?}");
+
+            if let Err(e) = payment_tx.send(PaymentMessage::InvoicePaid(callback.payment_hash)) {
+                warn!("Could not send invoice update: {}", e);
+                return Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::from("Error processing callback"))
+                    .unwrap());
+            }
+
             Ok(Response::builder()
-               .status(StatusCode::NOT_FOUND)
-               .body(Body::from("Nothing here."))
-               .unwrap())
+                .status(StatusCode::OK)
+                .body(Body::from("ok"))
+                .unwrap())
+        }
+        // Endpoint for relays terms
+        ("/terms", false) => Ok(Response::builder()
+            .status(200)
+            .header("Content-Type", "text/plain")
+            .body(Body::from(settings.pay_to_relay.terms_message))
+            .unwrap()),
+        // Endpoint to allow users to sign up
+        ("/join", false) => {
+            // Stops sign ups if disabled
+            if !settings.pay_to_relay.sign_ups {
+                return Ok(Response::builder()
+                    .status(401)
+                    .header("Content-Type", "text/plain")
+                    .body(Body::from("Sorry, joining is not allowed at the moment"))
+                    .unwrap());
+            }
+
+            let html = r#"
+<!doctype HTML>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+      font-family: Arial, sans-serif;
+      background-color: #6320a7;
+      color: white;
+    }
+
+    .container {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 400px;
+    }
+
+    a {
+      color: pink;
+    }
+
+    input[type="text"] {
+        width: 100%;
+        max-width: 500px;
+        box-sizing: border-box;
+        overflow-x: auto;
+        white-space: nowrap;
+    }
+  </style>
+</head>
+<body>
+  <div style="width:75%;">
+    <h1>Enter your pubkey</h1>
+    <form action="/invoice" onsubmit="return checkForm(this);">
+      <input type="text" name="pubkey" id="pubkey-input"><br><br>
+      <input type="checkbox" id="terms" required>
+      <label for="terms">I agree to the <a href="/terms">terms and conditions</a></label><br><br>
+      <button type="submit">Submit</button>
+    </form>
+    <button id="get-public-key-btn">Get Public Key</button>
+  </div>
+  <script>
+    function checkForm(form) {
+      if (!form.terms.checked) {
+        alert("Please agree to the terms and conditions");
+        return false;
+      }
+      return true;
+    }
+
+    const pubkeyInput = document.getElementById('pubkey-input');
+      const getPublicKeyBtn = document.getElementById('get-public-key-btn');
+      getPublicKeyBtn.addEventListener('click', async function() {
+        try {
+          const publicKey = await window.nostr.getPublicKey();
+          pubkeyInput.value = publicKey;
+        } catch (error) {
+          console.error(error);
+        }
+      });
+  </script>
+</body>
+</html>
+            "#;
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from(html))
+                .unwrap())
+        }
+        // Endpoint to display invoice
+        ("/invoice", false) => {
+            // Stops sign ups if disabled
+            if !settings.pay_to_relay.sign_ups {
+                return Ok(Response::builder()
+                    .status(401)
+                    .header("Content-Type", "text/plain")
+                    .body(Body::from("Sorry, joining is not allowed at the moment"))
+                    .unwrap());
+            }
+
+            // Get query pubkey from query string
+            let pubkey = get_pubkey(request);
+
+            // Redirect back to join page if no pub key is found in query string
+            if pubkey.is_none() {
+                return Ok(Response::builder()
+                    .status(404)
+                    .header("location", "/join")
+                    .body(Body::empty())
+                    .unwrap());
+            }
+
+            // Checks key is valid
+            let pubkey = pubkey.unwrap();
+            let key = Keys::from_pk_str(&pubkey);
+            if key.is_err() {
+                return Ok(Response::builder()
+                    .status(401)
+                    .header("Content-Type", "text/plain")
+                    .body(Body::from("Looks like your key is invalid"))
+                    .unwrap());
+            }
+
+            // Checks if user is already admitted
+            let payment_message;
+            if let Ok((admission_status, _)) = repo.get_account_balance(&key.unwrap()).await {
+                if admission_status {
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Body::from("Already admitted"))
+                        .unwrap());
+                } else {
+                    payment_message = PaymentMessage::CheckAccount(pubkey.clone());
+                }
+            } else {
+                payment_message = PaymentMessage::NewAccount(pubkey.clone());
+            }
+
+            // Send message on payment channel requesting invoice
+            if payment_tx.send(payment_message).is_err() {
+                warn!("Could not send payment tx");
+                return Ok(Response::builder()
+                    .status(501)
+                    .header("Content-Type", "text/plain")
+                    .body(Body::from("Sorry, something went wrong"))
+                    .unwrap());
+            }
+
+            // wait for message with invoice back that matched the pub key
+            let mut invoice_info: Option<InvoiceInfo> = None;
+            while let Ok(msg) = payment_tx.subscribe().recv().await {
+                match msg {
+                    PaymentMessage::Invoice(m_pubkey, m_invoice_info) => {
+                        if m_pubkey == pubkey.clone() {
+                            invoice_info = Some(m_invoice_info);
+                            break;
+                        }
+                    }
+                    PaymentMessage::AccountAdmitted(m_pubkey) => {
+                        if m_pubkey == pubkey.clone() {
+                            return Ok(Response::builder()
+                                .status(StatusCode::OK)
+                                .body(Body::from("Already admitted"))
+                                .unwrap());
+                        }
+                    }
+                    _ => (),
+                }
+            }
+
+            // Return early if cant get invoice
+            if invoice_info.is_none() {
+                return Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::from("Sorry, could not get invoice"))
+                    .unwrap());
+            }
+
+            // Since invoice is checked to be not none, unwrap
+            let invoice_info = invoice_info.unwrap();
+
+            let qr_code: String;
+            if let Ok(code) = QrCode::new(invoice_info.bolt11.as_bytes()) {
+                qr_code = code
+                    .render()
+                    .min_dimensions(200, 200)
+                    .dark_color(svg::Color("#800000"))
+                    .light_color(svg::Color("#ffff80"))
+                    .build();
+            } else {
+                qr_code = "Could not render image".to_string();
+            }
+
+            let html_result = format!(
+                r#"
+<!DOCTYPE html>
+<html>
+  <head>
+  <meta charset="UTF-8">
+    <style>
+      body {{
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        text-align: center;
+        font-family: Arial, sans-serif;
+        background-color:  #6320a7 ;
+        color: white;
+      }}
+      #copy-button {{
+        background-color: #bb5f0d ;
+        color: white;
+        padding: 10px 20px;
+        border-radius: 5px;
+        border: none;
+        cursor: pointer;
+      }}
+      #copy-button:hover {{
+        background-color: #8f29f4;
+      }}
+    .container {{
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        height: 400px;
+    }}
+    a {{
+        color: pink;
+    }}
+    </style>
+  </head>
+  <body>
+    <div style="width:75%;">
+      <h3>
+        To use this relay, an admission fee of {} sats is required. By paying the fee, you agree to the <a href='terms'>terms</a>.
+      </h3>
+    </div>
+    <div>
+        <div style="max-height: 300px;">
+            {}
+        </div>
+    </div>
+    <div>
+    <div style="width: 75%;">
+        <p style="overflow-wrap: break-word; width: 500px;">{}</p>
+        <button id="copy-button">Copy</button>
+    </div>
+    <div>
+        <p> This page will not refresh </p>
+        <p> Verify admission <a href=/account?pubkey={}>here</a> once you have paid</p>
+    </div>
+    </div>
+  </body>
+</html>
+
+
+<script>
+  const copyButton = document.getElementById("copy-button");
+  if (navigator.clipboard) {{
+    copyButton.addEventListener("click", function() {{
+      const textToCopy = "{}";
+      navigator.clipboard.writeText(textToCopy).then(function() {{
+        console.log("Text copied to clipboard");
+      }}, function(err) {{
+        console.error("Could not copy text: ", err);
+      }});
+    }});
+  }} else {{
+    copyButton.style.display = "none";
+    console.warn("Clipboard API is not supported in this browser");
+  }}
+</script>
+"#,
+                settings.pay_to_relay.admission_cost,
+                qr_code,
+                invoice_info.bolt11,
+                pubkey,
+                invoice_info.bolt11
+            );
+
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from(html_result))
+                .unwrap())
+        }
+        ("/account", false) => {
+            // Stops sign ups if disabled
+            if !settings.pay_to_relay.enabled {
+                return Ok(Response::builder()
+                    .status(401)
+                    .header("Content-Type", "text/plain")
+                    .body(Body::from("This relay is not paid"))
+                    .unwrap());
+            }
+
+            // Gets the pubkey from query string
+            let pubkey = get_pubkey(request);
+
+            // Redirect back to join page if no pub key is found in query string
+            if pubkey.is_none() {
+                return Ok(Response::builder()
+                    .status(404)
+                    .header("location", "/join")
+                    .body(Body::empty())
+                    .unwrap());
+            }
+
+            // Checks key is valid
+            let pubkey = pubkey.unwrap();
+            let key = Keys::from_pk_str(&pubkey);
+            if key.is_err() {
+                return Ok(Response::builder()
+                    .status(401)
+                    .header("Content-Type", "text/plain")
+                    .body(Body::from("Looks like your key is invalid"))
+                    .unwrap());
+            }
+
+            // Account is checked async so user will have to refresh the page a couple times after
+            // they have paid.
+            if let Err(e) = payment_tx.send(PaymentMessage::CheckAccount(pubkey.clone())) {
+                warn!("Could not check account: {}", e);
+            }
+            // Checks if user is already admitted
+            let text =
+                if let Ok((admission_status, _)) = repo.get_account_balance(&key.unwrap()).await {
+                    if admission_status {
+                        r#"<span style="color: green;">is</span>"#
+                    } else {
+                        r#"<span style="color: red;">is not</span>"#
+                    }
+                } else {
+                    "Could not get admission status"
+                };
+
+            let html_result = format!(
+                r#"
+            <!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8">
+    <style>
+      body {{
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        text-align: center;
+        font-family: Arial, sans-serif;
+        background-color: #6320a7;
+        color: white;
+        height: 100vh;
+      }}
+    </style>
+  </head>
+  <body>
+    <div>
+      <h5>{} {} admitted</h5>
+    </div>
+  </body>
+</html>
+
+
+            "#,
+                pubkey, text
+            );
+
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from(html_result))
+                .unwrap())
+        }
+        // later balance
+        (_, _) => {
+            // handle any other url
+            Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::from("Nothing here."))
+                .unwrap())
         }
     }
+}
+
+// Get pubkey from request query string
+fn get_pubkey(request: Request<Body>) -> Option<String> {
+    let query = request.uri().query().unwrap_or("").to_string();
+
+    // Gets the pubkey value from query string
+    query.split('&').fold(None, |acc, pair| {
+        let mut parts = pair.splitn(2, '=');
+        let key = parts.next();
+        let value = parts.next();
+        if key == Some("pubkey") {
+            return value.map(|s| s.to_owned());
+        }
+        acc
+    })
 }
 
 fn get_header_string(header: &str, headers: &HeaderMap) -> Option<String> {
@@ -206,6 +673,7 @@ fn get_header_string(header: &str, headers: &HeaderMap) -> Option<String> {
 async fn ctrl_c_or_signal(mut shutdown_signal: Receiver<()>) {
     let mut term_signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("could not define signal");
+    #[allow(clippy::never_loop)]
     loop {
         tokio::select! {
             _ = shutdown_signal.recv() => {
@@ -232,46 +700,47 @@ fn create_metrics() -> (Registry, NostrMetrics) {
     let query_sub = Histogram::with_opts(HistogramOpts::new(
         "nostr_query_seconds",
         "Subscription response times",
-    )).unwrap();
+    ))
+    .unwrap();
     let query_db = Histogram::with_opts(HistogramOpts::new(
         "nostr_filter_seconds",
         "Filter SQL query times",
-    )).unwrap();
+    ))
+    .unwrap();
     let write_events = Histogram::with_opts(HistogramOpts::new(
         "nostr_events_write_seconds",
         "Event writing response times",
-    )).unwrap();
+    ))
+    .unwrap();
     let sent_events = IntCounterVec::new(
-	Opts::new("nostr_events_sent_total", "Events sent to clients"),
-	vec!["source"].as_slice(),
-    ).unwrap();
-    let connections = IntCounter::with_opts(Opts::new(
-        "nostr_connections_total",
-        "New connections",
-    )).unwrap();
+        Opts::new("nostr_events_sent_total", "Events sent to clients"),
+        vec!["source"].as_slice(),
+    )
+    .unwrap();
+    let connections =
+        IntCounter::with_opts(Opts::new("nostr_connections_total", "New connections")).unwrap();
     let db_connections = IntGauge::with_opts(Opts::new(
-        "nostr_db_connections", "Active database connections"
-    )).unwrap();
+        "nostr_db_connections",
+        "Active database connections",
+    ))
+    .unwrap();
     let query_aborts = IntCounterVec::new(
         Opts::new("nostr_query_abort_total", "Aborted queries"),
         vec!["reason"].as_slice(),
-    ).unwrap();
-    let cmd_req = IntCounter::with_opts(Opts::new(
-        "nostr_cmd_req_total",
-        "REQ commands",
-    )).unwrap();
-    let cmd_event = IntCounter::with_opts(Opts::new(
-        "nostr_cmd_event_total",
-        "EVENT commands",
-    )).unwrap();
-    let cmd_close = IntCounter::with_opts(Opts::new(
-        "nostr_cmd_close_total",
-        "CLOSE commands",
-    )).unwrap();
+    )
+    .unwrap();
+    let cmd_req = IntCounter::with_opts(Opts::new("nostr_cmd_req_total", "REQ commands")).unwrap();
+    let cmd_event =
+        IntCounter::with_opts(Opts::new("nostr_cmd_event_total", "EVENT commands")).unwrap();
+    let cmd_close =
+        IntCounter::with_opts(Opts::new("nostr_cmd_close_total", "CLOSE commands")).unwrap();
+    let cmd_auth =
+        IntCounter::with_opts(Opts::new("nostr_cmd_auth_total", "AUTH commands")).unwrap();
     let disconnects = IntCounterVec::new(
         Opts::new("nostr_disconnects_total", "Client disconnects"),
         vec!["reason"].as_slice(),
-        ).unwrap();
+    )
+    .unwrap();
     registry.register(Box::new(query_sub.clone())).unwrap();
     registry.register(Box::new(query_db.clone())).unwrap();
     registry.register(Box::new(write_events.clone())).unwrap();
@@ -282,6 +751,7 @@ fn create_metrics() -> (Registry, NostrMetrics) {
     registry.register(Box::new(cmd_req.clone())).unwrap();
     registry.register(Box::new(cmd_event.clone())).unwrap();
     registry.register(Box::new(cmd_close.clone())).unwrap();
+    registry.register(Box::new(cmd_auth.clone())).unwrap();
     registry.register(Box::new(disconnects.clone())).unwrap();
     let metrics = NostrMetrics {
         query_sub,
@@ -290,13 +760,23 @@ fn create_metrics() -> (Registry, NostrMetrics) {
         sent_events,
         connections,
         db_connections,
-	disconnects,
+        disconnects,
         query_aborts,
-	cmd_req,
-	cmd_event,
-	cmd_close,
+        cmd_req,
+        cmd_event,
+        cmd_close,
+        cmd_auth,
     };
-    (registry,metrics)
+    (registry, metrics)
+}
+
+fn file_bytes(path: &str) -> Result<Vec<u8>> {
+    let f = File::open(path)?;
+    let mut reader = BufReader::new(f);
+    let mut buffer = Vec::new();
+    // Read file into vector.
+    reader.read_to_end(&mut buffer)?;
+    Ok(buffer)
 }
 
 /// Start running a Nostr relay server.
@@ -344,11 +824,12 @@ pub fn start_server(settings: &Settings, shutdown_rx: MpscReceiver<()>) -> Resul
         .enable_all()
         .thread_name_fn(|| {
             // give each thread a unique numeric name
-            static ATOMIC_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let id = ATOMIC_ID.fetch_add(1,Ordering::SeqCst);
+            static ATOMIC_ID: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let id = ATOMIC_ID.fetch_add(1, Ordering::SeqCst);
             format!("tokio-ws-{id}")
         })
-    // limit concurrent SQLite blocking threads
+        // limit concurrent SQLite blocking threads
         .max_blocking_threads(settings.limits.max_blocking_threads)
         .on_thread_start(|| {
             trace!("started new thread: {:?}", std::thread::current().name());
@@ -367,7 +848,7 @@ pub fn start_server(settings: &Settings, shutdown_rx: MpscReceiver<()>) -> Resul
         info!("listening on: {}", socket_addr);
         // all client-submitted valid events are broadcast to every
         // other client on this channel.  This should be large enough
-        // to accomodate slower readers (messages are dropped if
+        // to accommodate slower readers (messages are dropped if
         // clients can not keep up).
         let (bcast_tx, _) = broadcast::channel::<Event>(broadcast_buffer_limit);
         // validated events that need to be persisted are sent to the
@@ -386,33 +867,63 @@ pub fn start_server(settings: &Settings, shutdown_rx: MpscReceiver<()>) -> Resul
         // metadata events.
         let (metadata_tx, metadata_rx) = broadcast::channel::<Event>(4096);
 
-	let (registry, metrics) = create_metrics();
+        let (payment_tx, payment_rx) = broadcast::channel::<PaymentMessage>(4096);
+
+        let (registry, metrics) = create_metrics();
+
         // build a repository for events
         let repo = db::build_repo(&settings, metrics.clone()).await;
         // start the database writer task.  Give it a channel for
         // writing events, and for publishing events that have been
         // written (to all connected clients).
-        tokio::task::spawn(
-            db::db_writer(
-                repo.clone(),
-                settings.clone(),
-                event_rx,
-                bcast_tx.clone(),
-                metadata_tx.clone(),
-                shutdown_listen,
-            ));
+        tokio::task::spawn(db::db_writer(
+            repo.clone(),
+            settings.clone(),
+            event_rx,
+            bcast_tx.clone(),
+            metadata_tx.clone(),
+            payment_tx.clone(),
+            shutdown_listen,
+        ));
         info!("db writer created");
 
         // create a nip-05 verifier thread; if enabled.
         if settings.verified_users.mode != VerifiedUsersMode::Disabled {
-            let verifier_opt =
-                nip05::Verifier::new(repo.clone(), metadata_rx, bcast_tx.clone(), settings.clone());
+            let verifier_opt = nip05::Verifier::new(
+                repo.clone(),
+                metadata_rx,
+                bcast_tx.clone(),
+                settings.clone(),
+            );
             if let Ok(mut v) = verifier_opt {
                 if verified_users_active {
                     tokio::task::spawn(async move {
                         info!("starting up NIP-05 verifier...");
                         v.run().await;
                     });
+                }
+            }
+        }
+
+        // Create payments thread if pay to relay enabled
+        if settings.pay_to_relay.enabled {
+            let payment_opt = payment::Payment::new(
+                repo.clone(),
+                payment_tx.clone(),
+                payment_rx,
+                bcast_tx.clone(),
+                settings.clone(),
+            );
+            match payment_opt {
+                Ok(mut p) => {
+                    tokio::task::spawn(async move {
+                        info!("starting payment process ...");
+                        p.run().await;
+                    });
+                }
+                Err(e) => {
+                    error!("Failed to start payment process {e}");
+                    std::process::exit(1);
                 }
             }
         }
@@ -425,7 +936,7 @@ pub fn start_server(settings: &Settings, shutdown_rx: MpscReceiver<()>) -> Resul
                 Ok(()) => {
                     info!("control message requesting shutdown");
                     controlled_shutdown.send(()).ok();
-                },
+                }
                 Err(std::sync::mpsc::RecvError) => {
                     trace!("shutdown requestor is disconnected (this is normal)");
                 }
@@ -445,6 +956,12 @@ pub fn start_server(settings: &Settings, shutdown_rx: MpscReceiver<()>) -> Resul
         //let pool_monitor = pool.clone();
         //tokio::spawn(async move {db::monitor_pool("reader", pool_monitor).await;});
 
+        // Read in the favicon if it exists
+        let favicon = settings.info.favicon.as_ref().and_then(|x| {
+            info!("reading favicon...");
+            file_bytes(x).ok()
+        });
+
         // A `Service` is needed for every connection, so this
         // creates one from our `handle_request` function.
         let make_svc = make_service_fn(|conn: &AddrStream| {
@@ -452,8 +969,10 @@ pub fn start_server(settings: &Settings, shutdown_rx: MpscReceiver<()>) -> Resul
             let remote_addr = conn.remote_addr();
             let bcast = bcast_tx.clone();
             let event = event_tx.clone();
+            let payment_tx = payment_tx.clone();
             let stop = invoke_shutdown.clone();
             let settings = settings.clone();
+            let favicon = favicon.clone();
             let registry = registry.clone();
             let metrics = metrics.clone();
             async move {
@@ -466,7 +985,9 @@ pub fn start_server(settings: &Settings, shutdown_rx: MpscReceiver<()>) -> Resul
                         remote_addr,
                         bcast.clone(),
                         event.clone(),
+                        payment_tx.clone(),
                         stop.subscribe(),
+                        favicon.clone(),
                         registry.clone(),
                         metrics.clone(),
                     )
@@ -488,7 +1009,7 @@ pub fn start_server(settings: &Settings, shutdown_rx: MpscReceiver<()>) -> Resul
 #[derive(Deserialize, Serialize, Clone, PartialEq, Eq, Debug)]
 #[serde(untagged)]
 pub enum NostrMessage {
-    /// An `EVENT` message
+    /// `EVENT` and  `AUTH` messages
     EventMsg(EventCmd),
     /// A `REQ` message
     SubMsg(Subscription),
@@ -498,12 +1019,13 @@ pub enum NostrMessage {
 
 /// Convert Message to `NostrMessage`
 fn convert_to_msg(msg: &str, max_bytes: Option<usize>) -> Result<NostrMessage> {
-    let parsed_res: Result<NostrMessage> = serde_json::from_str(msg).map_err(std::convert::Into::into);
+    let parsed_res: Result<NostrMessage> =
+        serde_json::from_str(msg).map_err(std::convert::Into::into);
     match parsed_res {
         Ok(m) => {
             if let NostrMessage::SubMsg(_) = m {
                 // note; this only prints the first 16k of a REQ and then truncates.
-                trace!("REQ: {:?}",msg);
+                trace!("REQ: {:?}", msg);
             };
             if let NostrMessage::EventMsg(_) = m {
                 if let Some(max_size) = max_bytes {
@@ -528,9 +1050,33 @@ fn make_notice_message(notice: &Notice) -> Message {
     let json = match notice {
         Notice::Message(ref msg) => json!(["NOTICE", msg]),
         Notice::EventResult(ref res) => json!(["OK", res.id, res.status.to_bool(), res.msg]),
+        Notice::AuthChallenge(ref challenge) => json!(["AUTH", challenge]),
     };
 
     Message::text(json.to_string())
+}
+
+fn allowed_to_send(event_str: &str, conn: &conn::ClientConn, settings: &Settings) -> bool {
+    // TODO: pass in kind so that we can avoid deserialization for most events
+    if settings.authorization.nip42_dms {
+        match serde_json::from_str::<Event>(event_str) {
+            Ok(event) => {
+                if event.kind == 4 || event.kind == 44 || event.kind == 1059 {
+                    match (conn.auth_pubkey(), event.tag_values_by_name("p").first()) {
+                        (Some(auth_pubkey), Some(recipient_pubkey)) => {
+                            recipient_pubkey == auth_pubkey || &event.pubkey == auth_pubkey
+                        }
+                        (_, _) => false,
+                    }
+                } else {
+                    true
+                }
+            }
+            Err(_) => false,
+        }
+    } else {
+        true
+    }
 }
 
 struct ClientInfo {
@@ -604,10 +1150,8 @@ async fn nostr_server(
 
     let unspec = "<unspecified>".to_string();
     info!("new client connection (cid: {}, ip: {:?})", cid, conn.ip());
-    let origin = client_info.origin.as_ref().unwrap_or_else(|| &unspec);
-    let user_agent = client_info
-        .user_agent.as_ref()
-        .unwrap_or_else(|| &unspec);
+    let origin = client_info.origin.as_ref().unwrap_or(&unspec);
+    let user_agent = client_info.user_agent.as_ref().unwrap_or(&unspec);
     info!(
         "cid: {}, origin: {:?}, user-agent: {:?}",
         cid, origin, user_agent
@@ -616,10 +1160,22 @@ async fn nostr_server(
     // Measure connections
     metrics.connections.inc();
 
+    if settings.authorization.nip42_auth {
+        conn.generate_auth_challenge();
+        if let Some(challenge) = conn.auth_challenge() {
+            ws_stream
+                .send(make_notice_message(&Notice::AuthChallenge(
+                    challenge.to_string(),
+                )))
+                .await
+                .ok();
+        }
+    }
+
     loop {
         tokio::select! {
             _ = shutdown.recv() => {
-		metrics.disconnects.with_label_values(&["shutdown"]).inc();
+        metrics.disconnects.with_label_values(&["shutdown"]).inc();
                 info!("Close connection down due to shutdown, client: {}, ip: {:?}, connected: {:?}", cid, conn.ip(), orig_start.elapsed());
                 // server shutting down, exit loop
                 break;
@@ -629,7 +1185,7 @@ async fn nostr_server(
                 // if it has been too long, disconnect
                 if last_message_time.elapsed() > max_quiet_time {
                     debug!("ending connection due to lack of client ping response");
-		    metrics.disconnects.with_label_values(&["timeout"]).inc();
+            metrics.disconnects.with_label_values(&["timeout"]).inc();
                     break;
                 }
                 // Send a ping
@@ -644,9 +1200,9 @@ async fn nostr_server(
                 if query_result.event == "EOSE" {
                     let send_str = format!("[\"EOSE\",\"{subesc}\"]");
                     ws_stream.send(Message::Text(send_str)).await.ok();
-                } else {
+                } else if allowed_to_send(&query_result.event, &conn, &settings) {
+                    metrics.sent_events.with_label_values(&["db"]).inc();
                     client_received_event_count += 1;
-		    metrics.sent_events.with_label_values(&["db"]).inc();
                     // send a result
                     let send_str = format!("[\"EVENT\",\"{}\",{}]", subesc, &query_result.event);
                     ws_stream.send(Message::Text(send_str)).await.ok();
@@ -663,13 +1219,15 @@ async fn nostr_server(
                     // TODO: serialize at broadcast time, instead of
                     // once for each consumer.
                     if let Ok(event_str) = serde_json::to_string(&global_event) {
-                        trace!("sub match for client: {}, sub: {:?}, event: {:?}",
+                        if allowed_to_send(&event_str, &conn, &settings) {
+                            // create an event response and send it
+                            trace!("sub match for client: {}, sub: {:?}, event: {:?}",
                                cid, s,
                                global_event.get_event_id_prefix());
-                        // create an event response and send it
-                        let subesc = s.replace('"', "");
-			metrics.sent_events.with_label_values(&["realtime"]).inc();
-                        ws_stream.send(Message::Text(format!("[\"EVENT\",\"{subesc}\",{event_str}]"))).await.ok();
+                            let subesc = s.replace('"', "");
+                            metrics.sent_events.with_label_values(&["realtime"]).inc();
+                            ws_stream.send(Message::Text(format!("[\"EVENT\",\"{subesc}\",{event_str}]"))).await.ok();
+                        }
                     } else {
                         warn!("could not serialize event: {:?}", global_event.get_event_id_prefix());
                     }
@@ -704,20 +1262,20 @@ async fn nostr_server(
                              WsError::Protocol(tungstenite::error::ProtocolError::ResetWithoutClosingHandshake)))
                         => {
                             debug!("websocket close from client (cid: {}, ip: {:?})",cid, conn.ip());
-			    metrics.disconnects.with_label_values(&["normal"]).inc();
+                metrics.disconnects.with_label_values(&["normal"]).inc();
                             break;
                         },
                     Some(Err(WsError::Io(e))) => {
                         // IO errors are considered fatal
                         warn!("IO error (cid: {}, ip: {:?}): {:?}", cid, conn.ip(), e);
-			metrics.disconnects.with_label_values(&["error"]).inc();
+            metrics.disconnects.with_label_values(&["error"]).inc();
 
                         break;
                     }
                     x => {
                         // default condition on error is to close the client connection
                         info!("unknown error (cid: {}, ip: {:?}): {:?} (closing conn)", cid, conn.ip(), x);
-			metrics.disconnects.with_label_values(&["error"]).inc();
+            metrics.disconnects.with_label_values(&["error"]).inc();
 
                         break;
                     }
@@ -729,16 +1287,27 @@ async fn nostr_server(
                         // An EventCmd needs to be validated to be converted into an Event
                         // handle each type of message
                         let evid = ec.event_id().to_owned();
-                        let parsed : Result<Event> = Result::<Event>::from(ec);
-			metrics.cmd_event.inc();
+                        let parsed : Result<EventWrapper> = Result::<EventWrapper>::from(ec);
                         match parsed {
-                            Ok(e) => {
+                            Ok(WrappedEvent(e)) => {
+                                metrics.cmd_event.inc();
                                 let id_prefix:String = e.id.chars().take(8).collect();
                                 debug!("successfully parsed/validated event: {:?} (cid: {}, kind: {})", id_prefix, cid, e.kind);
-                                // check if the event is too far in the future.
-                                if e.is_valid_timestamp(settings.options.reject_future_seconds) {
+                                // check if event is expired
+                                if e.is_expired() {
+                                    let notice = Notice::invalid(e.id, "The event has already expired");
+                                    ws_stream.send(make_notice_message(&notice)).await.ok();
+                                    // check if the event is too far in the future.
+                                } else if e.is_valid_timestamp(settings.options.reject_future_seconds) {
                                     // Write this to the database.
-                                    let submit_event = SubmittedEvent { event: e.clone(), notice_tx: notice_tx.clone(), source_ip: conn.ip().to_string(), origin: client_info.origin.clone(), user_agent: client_info.user_agent.clone()};
+                                    let auth_pubkey = conn.auth_pubkey().and_then(|pubkey| hex::decode(pubkey).ok());
+                                    let submit_event = SubmittedEvent {
+                                        event: e.clone(),
+                                        notice_tx: notice_tx.clone(),
+                                        source_ip: conn.ip().to_string(),
+                                        origin: client_info.origin.clone(),
+                                        user_agent: client_info.user_agent.clone(),
+                                        auth_pubkey };
                                     event_tx.send(submit_event).await.ok();
                                     client_published_event_count += 1;
                                 } else {
@@ -750,7 +1319,39 @@ async fn nostr_server(
                                     }
                                 }
                             },
+                            Ok(WrappedAuth(event)) => {
+                                metrics.cmd_auth.inc();
+                                if settings.authorization.nip42_auth {
+                                    let id_prefix:String = event.id.chars().take(8).collect();
+                                    debug!("successfully parsed auth: {:?} (cid: {})", id_prefix, cid);
+                                    match &settings.info.relay_url {
+                                        None => {
+                                            error!("AUTH command received, but relay_url is not set in the config file (cid: {})", cid);
+                                        },
+                                        Some(relay) => {
+                                            match conn.authenticate(&event, relay) {
+                                                Ok(_) => {
+                                                    let pubkey = match conn.auth_pubkey() {
+                                                        Some(k) => k.chars().take(8).collect(),
+                                                        None => "<unspecified>".to_string(),
+                                                    };
+                                                    info!("client is authenticated: (cid: {}, pubkey: {:?})", cid, pubkey);
+                                                },
+                                                Err(e) => {
+                                                    info!("authentication error: {} (cid: {})", e, cid);
+                                                    ws_stream.send(make_notice_message(&Notice::restricted(event.id, format!("authentication error: {e}").as_str()))).await.ok();
+                                                },
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    let e = CommandUnknownError;
+                                    info!("client sent an invalid event (cid: {})", cid);
+                                    ws_stream.send(make_notice_message(&Notice::invalid(evid, &format!("{e}")))).await.ok();
+                                }
+                            },
                             Err(e) => {
+                                metrics.cmd_event.inc();
                                 info!("client sent an invalid event (cid: {})", cid);
                                 ws_stream.send(make_notice_message(&Notice::invalid(evid, &format!("{e}")))).await.ok();
                             }
@@ -767,9 +1368,14 @@ async fn nostr_server(
                         if conn.has_subscription(&s) {
                             info!("client sent duplicate subscription, ignoring (cid: {}, sub: {:?})", cid, s.id);
                         } else {
-			    metrics.cmd_req.inc();
+                            metrics.cmd_req.inc();
                             if let Some(ref lim) = sub_lim_opt {
                                 lim.until_ready_with_jitter(jitter).await;
+                            }
+                            if settings.limits.limit_scrapers && s.is_scraper() {
+                                info!("subscription was scraper, ignoring (cid: {}, sub: {:?})", cid, s.id);
+                                ws_stream.send(Message::Text(format!("[\"EOSE\",\"{}\"]", s.id))).await.ok();
+                                continue
                             }
                             let (abandon_query_tx, abandon_query_rx) = oneshot::channel::<()>();
                             match conn.subscribe(s.clone()) {
@@ -794,7 +1400,7 @@ async fn nostr_server(
                         // closing a request simply removes the subscription.
                         let parsed : Result<Close> = Result::<Close>::from(cc);
                         if let Ok(c) = parsed {
-			    metrics.cmd_close.inc();
+                            metrics.cmd_close.inc();
                             // check if a query is currently
                             // running, and remove it if so.
                             let stop_tx = running_queries.remove(&c.id);
@@ -844,16 +1450,16 @@ async fn nostr_server(
 
 #[derive(Clone)]
 pub struct NostrMetrics {
-    pub query_sub: Histogram, // response time of successful subscriptions
-    pub query_db: Histogram, // individual database query execution time
-    pub db_connections: IntGauge, // database connections in use
-    pub write_events: Histogram, // response time of event writes
-    pub sent_events: IntCounterVec, // count of events sent to clients
-    pub connections: IntCounter, // count of websocket connections
-    pub disconnects: IntCounterVec, // client disconnects
+    pub query_sub: Histogram,        // response time of successful subscriptions
+    pub query_db: Histogram,         // individual database query execution time
+    pub db_connections: IntGauge,    // database connections in use
+    pub write_events: Histogram,     // response time of event writes
+    pub sent_events: IntCounterVec,  // count of events sent to clients
+    pub connections: IntCounter,     // count of websocket connections
+    pub disconnects: IntCounterVec,  // client disconnects
     pub query_aborts: IntCounterVec, // count of queries aborted by server
-    pub cmd_req: IntCounter, // count of REQ commands received
-    pub cmd_event: IntCounter, // count of EVENT commands received
-    pub cmd_close: IntCounter, // count of CLOSE commands received
-
+    pub cmd_req: IntCounter,         // count of REQ commands received
+    pub cmd_event: IntCounter,       // count of EVENT commands received
+    pub cmd_close: IntCounter,       // count of CLOSE commands received
+    pub cmd_auth: IntCounter,        // count of AUTH commands received
 }

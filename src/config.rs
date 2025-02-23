@@ -1,8 +1,8 @@
 //! Configuration file and settings management
+use crate::payment::Processor;
 use config::{Config, ConfigError, File};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use tracing::warn;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[allow(unused)]
@@ -12,6 +12,9 @@ pub struct Info {
     pub description: Option<String>,
     pub pubkey: Option<String>,
     pub contact: Option<String>,
+    pub favicon: Option<String>,
+    pub relay_icon: Option<String>,
+    pub relay_page: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,12 +26,14 @@ pub struct Database {
     pub min_conn: u32,
     pub max_conn: u32,
     pub connection: String,
+    pub connection_write: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(unused)]
 pub struct Grpc {
     pub event_admission_server: Option<String>,
+    pub restricts_write: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,13 +73,33 @@ pub struct Limits {
     pub max_ws_frame_bytes: Option<usize>,
     pub broadcast_buffer: usize, // events to buffer for subscribers (prevents slow readers from consuming memory)
     pub event_persist_buffer: usize, // events to buffer for database commits (block senders if database writes are too slow)
-    pub event_kind_blacklist: Option<Vec<u64>>
+    pub event_kind_blacklist: Option<Vec<u64>>,
+    pub event_kind_allowlist: Option<Vec<u64>>,
+    pub limit_scrapers: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(unused)]
 pub struct Authorization {
     pub pubkey_whitelist: Option<Vec<String>>, // If present, only allow these pubkeys to publish events
+    pub nip42_auth: bool,                      // if true enables NIP-42 authentication
+    pub nip42_dms: bool, // if true send DMs only to their authenticated recipients
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(unused)]
+pub struct PayToRelay {
+    pub enabled: bool,
+    pub admission_cost: u64, // Cost to have pubkey whitelisted
+    pub cost_per_event: u64, // Cost author to pay per event
+    pub node_url: String,
+    pub api_secret: String,
+    pub terms_message: String,
+    pub sign_ups: bool,       // allow new users to sign up to relay
+    pub direct_message: bool, // Send direct message to user with invoice and terms
+    pub secret_key: Option<String>,
+    pub processor: Processor,
+    pub rune_path: Option<String>, // To access clightning API
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,6 +172,13 @@ impl VerifiedUsers {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(unused)]
+pub struct Logging {
+    pub folder_path: Option<String>,
+    pub file_prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(unused)]
 pub struct Settings {
     pub info: Info,
     pub diagnostics: Diagnostics,
@@ -155,38 +187,48 @@ pub struct Settings {
     pub network: Network,
     pub limits: Limits,
     pub authorization: Authorization,
+    pub pay_to_relay: PayToRelay,
     pub verified_users: VerifiedUsers,
     pub retention: Retention,
     pub options: Options,
+    pub logging: Logging,
 }
 
 impl Settings {
-    #[must_use]
-    pub fn new(config_file_name: &Option<String>) -> Self {
+    pub fn new(config_file_name: &Option<String>) -> Result<Self, ConfigError> {
         let default_settings = Self::default();
         // attempt to construct settings with file
         let from_file = Self::new_from_default(&default_settings, config_file_name);
         match from_file {
-            Ok(f) => f,
             Err(e) => {
-                warn!("Error reading config file ({:?})", e);
-                default_settings
+                // pass up the parse error if the config file was specified,
+                // otherwise use the default config (with a warning).
+                if config_file_name.is_some() {
+                    Err(e)
+                } else {
+                    eprintln!("Error reading config file ({:?})", e);
+                    eprintln!("WARNING: Default configuration settings will be used");
+                    Ok(default_settings)
+                }
             }
+            ok => ok,
         }
     }
 
-
-    fn new_from_default(default: &Settings, config_file_name: &Option<String>) -> Result<Self, ConfigError> {
+    fn new_from_default(
+        default: &Settings,
+        config_file_name: &Option<String>,
+    ) -> Result<Self, ConfigError> {
         let default_config_file_name = "config.toml".to_string();
         let config: &String = match config_file_name {
             Some(value) => value,
-            None => &default_config_file_name
+            None => &default_config_file_name,
         };
         let builder = Config::builder();
         let config: Config = builder
-        // use defaults
+            // use defaults
             .add_source(Config::try_from(default)?)
-        // override with file contents
+            // override with file contents
             .add_source(File::with_name(config))
             .build()?;
         let mut settings: Settings = config.try_deserialize()?;
@@ -204,6 +246,31 @@ impl Settings {
         );
         // initialize durations for verified users
         settings.verified_users.init();
+
+        // Validate pay to relay settings
+        if settings.pay_to_relay.enabled {
+            if settings.pay_to_relay.processor == Processor::ClnRest {
+                assert!(settings
+                    .pay_to_relay
+                    .rune_path
+                    .as_ref()
+                    .is_some_and(|path| path != "<rune path>"));
+            } else if settings.pay_to_relay.processor == Processor::LNBits {
+                assert_ne!(settings.pay_to_relay.api_secret, "");
+            }
+            // Should check that url is valid
+            assert_ne!(settings.pay_to_relay.node_url, "");
+            assert_ne!(settings.pay_to_relay.terms_message, "");
+
+            if settings.pay_to_relay.direct_message {
+                assert!(settings
+                    .pay_to_relay
+                    .secret_key
+                    .as_ref()
+                    .is_some_and(|key| key != "<nostr nsec>"));
+            }
+        }
+
         Ok(settings)
     }
 }
@@ -217,6 +284,9 @@ impl Default for Settings {
                 description: None,
                 pubkey: None,
                 contact: None,
+                favicon: None,
+                relay_icon: None,
+                relay_page: None,
             },
             diagnostics: Diagnostics { tracing: false },
             database: Database {
@@ -225,10 +295,12 @@ impl Default for Settings {
                 in_memory: false,
                 min_conn: 4,
                 max_conn: 8,
-		connection: "".to_owned(),
+                connection: "".to_owned(),
+                connection_write: None,
             },
             grpc: Grpc {
                 event_admission_server: None,
+                restricts_write: false,
             },
             network: Network {
                 port: 8080,
@@ -247,9 +319,26 @@ impl Default for Settings {
                 broadcast_buffer: 16384,
                 event_persist_buffer: 4096,
                 event_kind_blacklist: None,
+                event_kind_allowlist: None,
+                limit_scrapers: false,
             },
             authorization: Authorization {
                 pubkey_whitelist: None, // Allow any address to publish
+                nip42_auth: false,      // Disable NIP-42 authentication
+                nip42_dms: false,       // Send DMs to everybody
+            },
+            pay_to_relay: PayToRelay {
+                enabled: false,
+                admission_cost: 4200,
+                cost_per_event: 0,
+                terms_message: "".to_string(),
+                node_url: "".to_string(),
+                api_secret: "".to_string(),
+                rune_path: None,
+                sign_ups: false,
+                direct_message: false,
+                secret_key: None,
+                processor: Processor::LNBits,
             },
             verified_users: VerifiedUsers {
                 mode: VerifiedUsersMode::Disabled,
@@ -269,6 +358,10 @@ impl Default for Settings {
             },
             options: Options {
                 reject_future_seconds: None, // Reject events in the future if defined
+            },
+            logging: Logging {
+                folder_path: None,
+                file_prefix: None,
             },
         }
     }

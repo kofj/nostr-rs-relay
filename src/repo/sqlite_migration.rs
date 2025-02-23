@@ -4,13 +4,13 @@ use crate::error::Result;
 use crate::event::{single_char_tagname, Event};
 use crate::utils::is_lower_hex;
 use const_format::formatcp;
+use indicatif::{ProgressBar, ProgressStyle};
 use rusqlite::limits::Limit;
 use rusqlite::params;
 use rusqlite::Connection;
 use std::cmp::Ordering;
 use std::time::Instant;
 use tracing::{debug, error, info};
-use indicatif::{ProgressBar, ProgressStyle};
 
 /// Startup DB Pragmas
 pub const STARTUP_SQL: &str = r##"
@@ -19,11 +19,11 @@ PRAGMA foreign_keys = ON;
 PRAGMA journal_size_limit = 32768;
 PRAGMA temp_store = 2; -- use memory, not temp files
 PRAGMA main.cache_size = 20000; -- 80MB max cache size per conn
-pragma mmap_size = 17179869184; -- cap mmap at 16GB
+pragma mmap_size = 0; -- disable mmap (default)
 "##;
 
 /// Latest database version
-pub const DB_VERSION: usize = 16;
+pub const DB_VERSION: usize = 18;
 
 /// Schema definition
 const INIT_SQL: &str = formatcp!(
@@ -40,9 +40,10 @@ PRAGMA user_version = {};
 -- Event Table
 CREATE TABLE IF NOT EXISTS event (
 id INTEGER PRIMARY KEY,
-event_hash BLOB NOT NULL, -- 4-byte hash
+event_hash BLOB NOT NULL, -- 32-byte SHA256 hash
 first_seen INTEGER NOT NULL, -- when the event was first seen (not authored!) (seconds since 1970)
 created_at INTEGER NOT NULL, -- when the event was authored
+expires_at INTEGER, -- when the event expires and may be deleted
 author BLOB NOT NULL, -- author pubkey
 delegated_by BLOB, -- delegator pubkey (NIP-26)
 kind INTEGER NOT NULL, -- event kind
@@ -61,6 +62,7 @@ CREATE INDEX IF NOT EXISTS kind_author_index ON event(kind,author);
 CREATE INDEX IF NOT EXISTS kind_created_at_index ON event(kind,created_at);
 CREATE INDEX IF NOT EXISTS author_created_at_index ON event(author,created_at);
 CREATE INDEX IF NOT EXISTS author_kind_index ON event(author,kind);
+CREATE INDEX IF NOT EXISTS event_expiration ON event(expires_at);
 
 -- Tag Table
 -- Tag values are stored as either a BLOB (if they come in as a
@@ -94,6 +96,35 @@ FOREIGN KEY(metadata_event) REFERENCES event(id) ON UPDATE CASCADE ON DELETE CAS
 );
 CREATE INDEX IF NOT EXISTS user_verification_name_index ON user_verification(name);
 CREATE INDEX IF NOT EXISTS user_verification_event_index ON user_verification(metadata_event);
+
+-- Create account table
+CREATE TABLE IF NOT EXISTS account (
+pubkey TEXT PRIMARY KEY,
+is_admitted INTEGER NOT NULL DEFAULT 0,
+balance INTEGER NOT NULL DEFAULT 0,
+tos_accepted_at INTEGER
+);
+
+-- Create account index
+CREATE INDEX IF NOT EXISTS user_pubkey_index ON account(pubkey);
+
+-- Invoice table
+CREATE TABLE IF NOT EXISTS invoice (
+payment_hash TEXT PRIMARY KEY,
+pubkey TEXT NOT NULL,
+invoice TEXT NOT NULL,
+amount INTEGER NOT NULL,
+status TEXT CHECK ( status IN ('Paid', 'Unpaid', 'Expired' ) ) NOT NUll DEFAULT 'Unpaid',
+description TEXT,
+created_at INTEGER NOT NULL,
+confirmed_at INTEGER,
+CONSTRAINT invoice_pubkey_fkey FOREIGN KEY (pubkey) REFERENCES account (pubkey) ON DELETE CASCADE
+);
+
+-- Create invoice index
+CREATE INDEX IF NOT EXISTS invoice_pubkey_index ON invoice(pubkey);
+
+
 "##,
     DB_VERSION
 );
@@ -128,7 +159,7 @@ fn mig_init(conn: &mut PooledConnection) -> usize {
             );
         }
         Err(err) => {
-            error!("update failed: {}", err);
+            error!("update (init) failed: {}", err);
             panic!("database could not be initialized");
         }
     }
@@ -208,6 +239,12 @@ pub fn upgrade_db(conn: &mut PooledConnection) -> Result<usize> {
             if curr_version == 15 {
                 curr_version = mig_15_to_16(conn)?;
             }
+            if curr_version == 16 {
+                curr_version = mig_16_to_17(conn)?;
+            }
+            if curr_version == 17 {
+                curr_version = mig_17_to_18(conn)?;
+            }
 
             if curr_version == DB_VERSION {
                 info!(
@@ -248,8 +285,8 @@ pub fn rebuild_tags(conn: &mut PooledConnection) -> Result<()> {
         let mut stmt = tx.prepare("select id, content from event order by id;")?;
         let mut tag_rows = stmt.query([])?;
         while let Some(row) = tag_rows.next()? {
-            if (events_processed as f32)/(count as f32) > percent_done {
-                info!("Tag update {}% complete...", (100.0*percent_done).round());
+            if (events_processed as f32) / (count as f32) > percent_done {
+                info!("Tag update {}% complete...", (100.0 * percent_done).round());
                 percent_done += update_each_percent;
             }
             // we want to capture the event_id that had the tag, the tag name, and the tag hex value.
@@ -258,7 +295,7 @@ pub fn rebuild_tags(conn: &mut PooledConnection) -> Result<()> {
             let event: Event = serde_json::from_str(&event_json)?;
             // look at each event, and each tag, creating new tag entries if appropriate.
             for t in event.tags.iter().filter(|x| x.len() > 1) {
-                let tagname = t.get(0).unwrap();
+                let tagname = t.first().unwrap();
                 let tagnamechar_opt = single_char_tagname(tagname);
                 if tagnamechar_opt.is_none() {
                     continue;
@@ -288,9 +325,7 @@ pub fn rebuild_tags(conn: &mut PooledConnection) -> Result<()> {
     Ok(())
 }
 
-
-
-//// Migration Scripts
+// Migration Scripts
 
 fn mig_1_to_2(conn: &mut PooledConnection) -> Result<usize> {
     // only change is adding a hidden column to events.
@@ -304,7 +339,7 @@ PRAGMA user_version = 2;
             info!("database schema upgraded v1 -> v2");
         }
         Err(err) => {
-            error!("update failed: {}", err);
+            error!("update (v1->v2) failed: {}", err);
             panic!("database could not be upgraded");
         }
     }
@@ -331,7 +366,7 @@ PRAGMA user_version = 3;
             info!("database schema upgraded v2 -> v3");
         }
         Err(err) => {
-            error!("update failed: {}", err);
+            error!("update (v2->v3) failed: {}", err);
             panic!("database could not be upgraded");
         }
     }
@@ -381,7 +416,7 @@ PRAGMA user_version = 4;
             info!("database schema upgraded v3 -> v4");
         }
         Err(err) => {
-            error!("update failed: {}", err);
+            error!("update (v3->v4) failed: {}", err);
             panic!("database could not be upgraded");
         }
     }
@@ -400,7 +435,7 @@ PRAGMA user_version=5;
             info!("database schema upgraded v4 -> v5");
         }
         Err(err) => {
-            error!("update failed: {}", err);
+            error!("update (v4->v5) failed: {}", err);
             panic!("database could not be upgraded");
         }
     }
@@ -426,7 +461,7 @@ fn mig_5_to_6(conn: &mut PooledConnection) -> Result<usize> {
             let event: Event = serde_json::from_str(&event_json)?;
             // look at each event, and each tag, creating new tag entries if appropriate.
             for t in event.tags.iter().filter(|x| x.len() > 1) {
-                let tagname = t.get(0).unwrap();
+                let tagname = t.first().unwrap();
                 let tagnamechar_opt = single_char_tagname(tagname);
                 if tagnamechar_opt.is_none() {
                     continue;
@@ -472,7 +507,7 @@ PRAGMA user_version = 7;
             info!("database schema upgraded v6 -> v7");
         }
         Err(err) => {
-            error!("update failed: {}", err);
+            error!("update (v6->v7) failed: {}", err);
             panic!("database could not be upgraded");
         }
     }
@@ -493,7 +528,7 @@ PRAGMA user_version = 8;
             info!("database schema upgraded v7 -> v8");
         }
         Err(err) => {
-            error!("update failed: {}", err);
+            error!("update (v7->v8) failed: {}", err);
             panic!("database could not be upgraded");
         }
     }
@@ -513,7 +548,7 @@ PRAGMA user_version = 9;
             info!("database schema upgraded v8 -> v9");
         }
         Err(err) => {
-            error!("update failed: {}", err);
+            error!("update (v8->v9) failed: {}", err);
             panic!("database could not be upgraded");
         }
     }
@@ -532,7 +567,7 @@ PRAGMA user_version = 10;
             info!("database schema upgraded v9 -> v10");
         }
         Err(err) => {
-            error!("update failed: {}", err);
+            error!("update (v9->v10) failed: {}", err);
             panic!("database could not be upgraded");
         }
     }
@@ -553,7 +588,7 @@ PRAGMA user_version = 11;
             info!("database schema upgraded v10 -> v11");
         }
         Err(err) => {
-            error!("update failed: {}", err);
+            error!("update (v10->v11) failed: {}", err);
             panic!("database could not be upgraded");
         }
     }
@@ -581,11 +616,17 @@ fn mig_11_to_12(conn: &mut PooledConnection) -> Result<usize> {
         tx.execute("PRAGMA user_version = 12;", [])?;
     }
     tx.commit()?;
-    info!("database schema upgraded v11 -> v12 in {:?}", start.elapsed());
+    info!(
+        "database schema upgraded v11 -> v12 in {:?}",
+        start.elapsed()
+    );
     // vacuum after large table modification
     let start = Instant::now();
     conn.execute("VACUUM;", [])?;
-    info!("vacuumed DB after hidden event cleanup in {:?}", start.elapsed());
+    info!(
+        "vacuumed DB after hidden event cleanup in {:?}",
+        start.elapsed()
+    );
     Ok(12)
 }
 
@@ -602,7 +643,7 @@ PRAGMA user_version = 13;
             info!("database schema upgraded v12 -> v13");
         }
         Err(err) => {
-            error!("update failed: {}", err);
+            error!("update (v12->v13) failed: {}", err);
             panic!("database could not be upgraded");
         }
     }
@@ -622,7 +663,7 @@ PRAGMA user_version = 14;
             info!("database schema upgraded v13 -> v14");
         }
         Err(err) => {
-            error!("update failed: {}", err);
+            error!("update (v13->v14) failed: {}", err);
             panic!("database could not be upgraded");
         }
     }
@@ -641,7 +682,7 @@ PRAGMA user_version = 15;
             info!("database schema upgraded v14 -> v15");
         }
         Err(err) => {
-            error!("update failed: {}", err);
+            error!("update (v14->v15) failed: {}", err);
             panic!("database could not be upgraded");
         }
     }
@@ -651,7 +692,7 @@ PRAGMA user_version = 15;
     match conn.execute_batch(clear_hidden_sql) {
         Ok(()) => {
             info!("all hidden events removed");
-        },
+        }
         Err(err) => {
             error!("delete failed: {}", err);
             panic!("could not remove hidden events");
@@ -662,7 +703,7 @@ PRAGMA user_version = 15;
 
 fn mig_15_to_16(conn: &mut PooledConnection) -> Result<usize> {
     let count = db_event_count(conn)?;
-    info!("database schema needs update from 15->16");
+    info!("database schema needs update from 15->16 (this may take a few minutes)");
     let upgrade_sql = r##"
 DROP TABLE tag;
 CREATE TABLE tag (
@@ -683,22 +724,22 @@ CREATE INDEX IF NOT EXISTS tag_covering_index ON tag(name,kind,value,created_at,
     let start = Instant::now();
     let tx = conn.transaction()?;
 
-    let bar = ProgressBar::new(count.try_into().unwrap())
-        .with_message("rebuilding tags table");
+    let bar = ProgressBar::new(count.try_into().unwrap()).with_message("rebuilding tags table");
     bar.set_style(
         ProgressStyle::with_template(
             "[{elapsed_precise}] {bar:40.white/blue} {pos:>7}/{len:7} [{percent}%] {msg}",
         )
-            .unwrap(),
+        .unwrap(),
     );
     {
         tx.execute_batch(upgrade_sql)?;
-        let mut stmt = tx.prepare("select id, kind, created_at, content from event order by id;")?;
+        let mut stmt =
+            tx.prepare("select id, kind, created_at, content from event order by id;")?;
         let mut tag_rows = stmt.query([])?;
         let mut count = 0;
         while let Some(row) = tag_rows.next()? {
             count += 1;
-            if count%10==0 {
+            if count % 10 == 0 {
                 bar.inc(10);
             }
             let event_id: u64 = row.get(0)?;
@@ -708,7 +749,7 @@ CREATE INDEX IF NOT EXISTS tag_covering_index ON tag(name,kind,value,created_at,
             let event: Event = serde_json::from_str(&event_json)?;
             // look at each event, and each tag, creating new tag entries if appropriate.
             for t in event.tags.iter().filter(|x| x.len() > 1) {
-                let tagname = t.get(0).unwrap();
+                let tagname = t.first().unwrap();
                 let tagnamechar_opt = single_char_tagname(tagname);
                 if tagnamechar_opt.is_none() {
                     continue;
@@ -726,6 +767,75 @@ CREATE INDEX IF NOT EXISTS tag_covering_index ON tag(name,kind,value,created_at,
     }
     bar.finish();
     tx.commit()?;
-    info!("database schema upgraded v15 -> v16 in {:?}", start.elapsed());
+    info!(
+        "database schema upgraded v15 -> v16 in {:?}",
+        start.elapsed()
+    );
     Ok(16)
+}
+
+fn mig_16_to_17(conn: &mut PooledConnection) -> Result<usize> {
+    info!("database schema needs update from 16->17");
+    let upgrade_sql = r##"
+ALTER TABLE event ADD COLUMN expires_at INTEGER;
+CREATE INDEX IF NOT EXISTS event_expiration ON event(expires_at);
+PRAGMA user_version = 17;
+"##;
+    match conn.execute_batch(upgrade_sql) {
+        Ok(()) => {
+            info!("database schema upgraded v16 -> v17");
+        }
+        Err(err) => {
+            error!("update (v16->v17) failed: {}", err);
+            panic!("database could not be upgraded");
+        }
+    }
+    Ok(17)
+}
+
+fn mig_17_to_18(conn: &mut PooledConnection) -> Result<usize> {
+    info!("database schema needs update from 17->18");
+    let upgrade_sql = r##"
+-- Create invoices table
+CREATE TABLE IF NOT EXISTS invoice (
+payment_hash TEXT PRIMARY KEY,
+pubkey TEXT NOT NULL,
+invoice TEXT NOT NULL,
+amount INTEGER NOT NULL,
+status TEXT CHECK ( status IN ('Paid', 'Unpaid', 'Expired' ) ) NOT NUll DEFAULT 'Unpaid',
+description TEXT,
+created_at INTEGER NOT NULL,
+confirmed_at INTEGER,
+CONSTRAINT invoice_pubkey_fkey FOREIGN KEY (pubkey) REFERENCES account (pubkey) ON DELETE CASCADE
+);
+
+-- Create invoice index
+CREATE INDEX IF NOT EXISTS invoice_pubkey_index ON invoice(pubkey);
+
+-- Create account table
+
+CREATE TABLE IF NOT EXISTS account (
+pubkey TEXT PRIMARY KEY,
+is_admitted INTEGER NOT NULL DEFAULT 0,
+balance INTEGER NOT NULL DEFAULT 0,
+tos_accepted_at INTEGER
+);
+
+-- Create account index
+CREATE INDEX IF NOT EXISTS account_pubkey_index ON account(pubkey);
+
+
+pragma optimize;
+PRAGMA user_version = 18;
+"##;
+    match conn.execute_batch(upgrade_sql) {
+        Ok(()) => {
+            info!("database schema upgraded v17 -> v18");
+        }
+        Err(err) => {
+            error!("update (v17->v18) failed: {}", err);
+            panic!("database could not be upgraded");
+        }
+    }
+    Ok(18)
 }
